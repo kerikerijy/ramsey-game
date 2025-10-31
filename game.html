@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>Ramsey Game (iPad対応)</title>
+  <!-- iPad/Safariでの拡大縮小・DPR対策 -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <style>
+    :root { color-scheme: light dark; }
+    body { text-align: center; font-family: system-ui, -apple-system, sans-serif; margin: 0; padding: 16px; }
+    .wrap { max-width: 720px; margin: 0 auto; }
+    /* キャンバスはCSSサイズで可変。実解像度はJSでDPRスケーリング */
+    canvas { 
+      background: #f4f4f4; 
+      display: block; 
+      margin: 10px auto; 
+      border: 1px solid #333; 
+      width: 100%;          /* 画面幅にフィット */
+      max-width: 500px;     /* 元の見た目を尊重 */
+      height: auto; 
+      touch-action: none;   /* ペン/指操作でのスクロール抑止 */
+    }
+    button { margin: 5px; padding: 10px 16px; font-size: 16px; border-radius: 10px; }
+    #turn { font-weight: 600; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>ラムゼーゲーム</h1>
+    <p id="turn">赤の番</p>
+    <!-- 表示サイズはCSSに任せ、実ピクセルはJSで設定 -->
+    <canvas id="game"></canvas>
+    <div>
+      <button id="undoBtn">戻る</button>
+      <button id="resetBtn">最初から</button>
+    </div>
+  </div>
+
+  <script>
+    const cvs = document.getElementById("game");
+    const ctx = cvs.getContext("2d");
+
+    // 幾何設定（レイアウトは後でリサイズ関数で再計算）
+    const n = 6;
+    const points = [];
+    const edges = {};
+    const history = [];
+    let currentColor = "red";
+    let gameOver = false;
+    let winEdges = [];
+    let selected = [];
+    const turnLabel = document.getElementById("turn");
+
+    // ==== Audio（iPad Safari対策込み） ====
+    let audioCtx = null;
+    function ensureAudioCtx() {
+      if (!audioCtx || audioCtx.state === "closed") {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      if (audioCtx.state === "suspended") audioCtx.resume();
+    }
+    function playClick(color) {
+      ensureAudioCtx();
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      osc.type = "square";
+      osc.frequency.value = (color === "red") ? 520 : 360;
+      gain.gain.setValueAtTime(0.08, audioCtx.currentTime);
+      osc.start();
+      osc.stop(audioCtx.currentTime + 0.1);
+    }
+
+    // ==== DPRスケーリング & レイアウト ====
+    function resizeCanvas() {
+      // CSS上の見かけサイズ
+      const rect = cvs.getBoundingClientRect();
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      // 実ピクセル解像度をDPRに合わせて設定
+      cvs.width  = Math.round(rect.width * dpr);
+      cvs.height = Math.round(rect.width * dpr); // 正方形にする（元500x500相当）
+      ctx.setTransform(1,0,0,1,0,0);
+      ctx.scale(dpr, dpr);
+
+      // 幾何の再計算（CSS座標系＝rect.width基準）
+      const size = rect.width;
+      const R = size * 0.40;
+      const center = { x: size * 0.5, y: size * 0.5 };
+
+      points.length = 0;
+      for (let i = 0; i < n; i++) {
+        const angle = (i / n) * 2 * Math.PI - Math.PI / 2;
+        points.push({
+          x: center.x + R * Math.cos(angle),
+          y: center.y + R * Math.sin(angle)
+        });
+      }
+
+      drawAll();
+    }
+
+    // イベント座標（CSSピクセル）を取得
+    function getEventPos(e) {
+      const rect = cvs.getBoundingClientRect();
+      let x, y;
+      if (e.touches && e.touches.length > 0) {
+        x = e.touches[0].clientX - rect.left;
+        y = e.touches[0].clientY - rect.top;
+      } else {
+        x = e.clientX - rect.left;
+        y = e.clientY - rect.top;
+      }
+      return { x, y };
+    }
+
+    // ==== 描画 ====
+    function drawAll() {
+      // クリアはCSS座標系で
+      const rect = cvs.getBoundingClientRect();
+      ctx.clearRect(0, 0, rect.width, rect.height);
+
+      // 辺
+      for (let key in edges) {
+        const e = edges[key];
+        const highlight = winEdges.some(w => w.a === e.a && w.b === e.b && w.color === e.color);
+        ctx.strokeStyle = highlight ? "gold" : e.color;
+        ctx.lineWidth = highlight ? 5 : 2;
+        ctx.beginPath();
+        ctx.moveTo(points[e.a].x, points[e.a].y);
+        ctx.lineTo(points[e.b].x, points[e.b].y);
+        ctx.stroke();
+      }
+
+      // 頂点
+      ctx.fillStyle = "black";
+      for (const p of points) {
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 6, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    // ==== 入力（Pointer EventsでiPad/PC両対応） ====
+    cvs.addEventListener("pointerdown", (e) => {
+      if (gameOver) return;
+
+      // iOSのオーディオポリシー：最初のユーザー操作でresume
+      ensureAudioCtx();
+
+      // 2点目以降をリセット（タップ連打の取りこぼし対策）
+      if (selected.length >= 2) selected = [];
+
+      const { x: mx, y: my } = getEventPos(e);
+
+      // 頂点ヒット判定（半径10px）
+      let hitIndex = -1;
+      for (let i = 0; i < n; i++) {
+        const dx = mx - points[i].x;
+        const dy = my - points[i].y;
+        if (Math.hypot(dx, dy) < 10) { hitIndex = i; break; }
+      }
+      if (hitIndex === -1) return;
+
+      playClick(currentColor);
+
+      selected.push(hitIndex);
+      if (selected.length === 2) {
+        let [a, b] = selected;
+        if (a === b) { selected = []; return; }
+        if (a > b) [a, b] = [b, a];
+        const key = `${a}-${b}`;
+        if (!edges[key]) {
+          edges[key] = { a, b, color: currentColor };
+          history.push(key);
+
+          const triangle = checkTriangle(currentColor);
+          if (triangle) {
+            winEdges = triangle.map(([i, j]) => ({ a: i, b: j, color: currentColor }));
+            drawAll();
+            gameOver = true;
+            selected = [];
+            setTimeout(() => {
+              alert(`${currentColor === "red" ? "赤" : "青"}の勝ち！`);
+              reset();
+            }, 50);
+            return;
+          }
+          currentColor = currentColor === "red" ? "blue" : "red";
+          turnLabel.textContent = currentColor === "red" ? "赤の番" : "青の番";
+        }
+        selected = [];
+      }
+      drawAll();
+    }, { passive: true });
+
+    function checkTriangle(color) {
+      const colorEdges = Object.values(edges).filter(e => e.color === color);
+      for (let i = 0; i < n; i++) {
+        for (let j = i + 1; j < n; j++) {
+          for (let k = j + 1; k < n; k++) {
+            if (hasEdge(colorEdges, i, j) && hasEdge(colorEdges, j, k) && hasEdge(colorEdges, i, k)) {
+              return [[i, j], [j, k], [i, k]];
+            }
+          }
+        }
+      }
+      return null;
+    }
+    function hasEdge(list, a, b) {
+      return list.some(e => (e.a === a && e.b === b) || (e.a === b && e.b === a));
+    }
+
+    function reset() {
+      for (let k in edges) delete edges[k];
+      history.length = 0;
+      winEdges = [];
+      currentColor = "red";
+      gameOver = false;
+      selected = [];
+      turnLabel.textContent = "赤の番";
+      // リサイズ時に点配置まで再計算するので、ここでも描画更新
+      drawAll();
+    }
+
+    function undo() {
+      if (history.length === 0 || gameOver) return;
+      const lastKey = history.pop();
+      delete edges[lastKey];
+      currentColor = currentColor === "red" ? "blue" : "red";
+      turnLabel.textContent = currentColor === "red" ? "赤の番" : "青の番";
+      selected = [];
+      drawAll();
+    }
+
+    document.getElementById("resetBtn").addEventListener("click", reset);
+    document.getElementById("undoBtn").addEventListener("click", undo);
+
+    // 初期化
+    window.addEventListener("resize", resizeCanvas);
+    // iPadのアドレスバー表示/非表示時にも走ることがあるので、少し遅延
+    window.addEventListener("load", () => setTimeout(resizeCanvas, 0));
+  </script>
+</body>
+</html>
